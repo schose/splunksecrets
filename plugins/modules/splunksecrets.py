@@ -116,8 +116,11 @@ from configparser import ConfigParser, MissingSectionHeaderError
 import os
 
 # Clean import via Ansible module_utils so the dependency is shipped with the module
-from ansible.module_utils.splunk_crypto import decrypt, encrypt, encrypt_new  # type: ignore
-
+from ansible_collections.schose.splunksecrets.plugins.module_utils.splunk_crypto import (  # type: ignore
+    decrypt,
+    encrypt,
+    encrypt_new,
+)
 
 def main():
     module_args = dict(
