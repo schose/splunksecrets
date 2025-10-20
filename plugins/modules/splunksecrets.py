@@ -167,7 +167,11 @@ def main():
         module.exit_json(**result)
 
     # Read INI
+    # Preserve key case when reading/writing
     parser = ConfigParser()
+    # By default, ConfigParser lower-cases option names. We need to preserve case.
+    # Setting optionxform to str keeps the original casing intact.
+    parser.optionxform = str  # type: ignore[attr-defined]
     try:
         # ConfigParser.read accepts encoding in Python 3
         read_ok = parser.read(path, encoding=encoding)
@@ -190,15 +194,25 @@ def main():
             module.fail_json(msg=f"Stanza/section '{stanza}' not found in {abs_path}", **result)
         module.exit_json(**result)
 
-    # Key present?
-    if not parser.has_option(stanza, key):
+    # Key present? We want a case-insensitive check but preserve original case for write-back
+    actual_key = None
+    if parser.has_section(stanza) or stanza == parser.default_section:
+        try:
+            for existing_key in parser.options(stanza):
+                if existing_key.lower() == key.lower():
+                    actual_key = existing_key
+                    break
+        except Exception:
+            pass
+
+    if actual_key is None:
         if fail_if_missing:
             module.fail_json(msg=f"Key '{key}' in stanza '{stanza}' not found in {abs_path}", **result)
         module.exit_json(**result)
 
     # Read value
     try:
-        value = parser.get(stanza, key)
+        value = parser.get(stanza, actual_key)
     except Exception as e:
         module.fail_json(msg=f"Error reading '{stanza}.{key}': {e}", **result)
 
@@ -262,7 +276,8 @@ def main():
 
     # Update INI and write back
     try:
-        parser.set(stanza, key, new_encrypted)
+        # Write back using the original key spelling
+        parser.set(stanza, actual_key, new_encrypted)
         with open(path, 'w', encoding=encoding) as fh:
             parser.write(fh)
     except Exception as e:
