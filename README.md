@@ -1,22 +1,97 @@
-# Ansible module: splunksecrets
+# schose.splunksecrets (Ansible Collection)
 
-The `splunksecrets` module manages passwords in Splunk configuration files using INI format (e.g. `authentication.conf`).
-It reads the current encrypted value from a stanza/key, decrypts it using `splunk.secret`, and compares it with the desired cleartext password.
+Manage encrypted passwords in Splunk INI configuration files (e.g. `authentication.conf`).
+The module reads the current encrypted value from a stanza/key, decrypts it using `splunk.secret`, compares it with the desired cleartext password, and updates the file if needed.
 
-- If the current cleartext equals the desired password: no change (`changed: false`, `msg: ok`).
-- Otherwise the new password is encrypted and written to the INI file (`changed: true`, `msg: updated password`).
+- If current cleartext equals the desired password → no change (`changed: false`, `msg: ok`).
+- Otherwise the new password is encrypted and written (`changed: true`, `msg: updated password`).
 
-Supported formats: `$1$` (RC4) and `$7$` (AES‑GCM). The module takes a path to `splunk.secret`.
+Supported formats: `$1$` (RC4) and `$7$` (AES‑GCM).
 
-## Repository structure
+## Install
 
-- `library/splunksecrets.py` – Ansible module
-- `module_utils/splunk_crypto.py` – crypto helpers (auto-shipped with module via Ansible)
-- `inventory.ini` – local inventory (interpreter pinned to your venv)
-- `ansible.cfg` – sets `library` and `module_utils` paths
-- `test.yml` – example playbook for `splunksecrets`
+You can install this collection from Ansible Galaxy, from GitHub via requirements, or from a local build artifact.
 
-Note: A prior demo module `hello_world` may still exist but is not required.
+### A) From Ansible Galaxy (recommended)
+
+```bash
+ansible-galaxy collection install git+https://github.com/schose/ansible_splunksecrets.git,main
+```
+
+### B) From GitHub (requirements.yml)
+
+Create a `requirements.yml`:
+
+```yaml
+collections:
+  - name: git+https://github.com/schose/splunksecrets.git
+    type: git
+    version: main   # or a tag, e.g. 1.0.0
+```
+
+Install:
+
+```bash
+ansible-galaxy collection install -r requirements.yml --force
+```
+
+### C) From a local build artifact
+
+```bash
+# in the collection root
+ansible-galaxy collection build
+ansible-galaxy collection install ./schose-splunksecrets-*.tar.gz --force
+```
+
+## Use in a playbook
+
+Use the Fully Qualified Collection Name (FQCN) or declare the collection at the play level.
+
+FQCN:
+
+```yaml
+- hosts: all
+  tasks:
+    - name: set passwords in authentication.conf
+      schose.splunksecrets.splunksecrets:
+        splunksecretfile: "/opt/splunk/etc/auth/splunk.secret"
+        password: "MySecretPassword42!"
+        path: "/opt/splunk/etc/apps/your_app/default/authentication.conf"
+        stanza: "your.realm"
+        key: "bindDNpassword"
+```
+
+With `collections:`:
+
+```yaml
+- hosts: all
+  collections:
+    - schose.splunksecrets
+  tasks:
+    - name: set passwords in authentication.conf
+      splunksecrets:
+        splunksecretfile: "/opt/splunk/etc/auth/splunk.secret"
+        password: "MySecretPassword42!"
+        path: "/opt/splunk/etc/apps/your_app/default/authentication.conf"
+        stanza: "your.realm"
+        key: "bindDNpassword"
+```
+
+Check-mode (dry-run):
+
+```bash
+ansible-playbook -i inventory.ini play.yml --check
+```
+
+## Module parameters
+
+- `path` (str, required, alias `file`): path to the INI file
+- `splunksecretfile` (str, default `/opt/splunk/etc/auth/splunk.secret`): path to `splunk.secret`
+- `password` (str, required, no_log=True): desired cleartext password
+- `stanza` (str, required, alias `section`): INI section (stanza)
+- `key` (str, required): key within the stanza
+- `fail_if_missing` (bool, default: true): fail if file/stanza/key are missing
+- `encoding` (str, default: `utf-8`): file encoding for INI
 
 ## Requirements
 
@@ -24,113 +99,23 @@ Note: A prior demo module `hello_world` may still exist but is not required.
 - Ansible
 - For `$7$` (AES‑GCM): Python package `cryptography` (for `$1$`, a pure‑Python RC4 fallback is used if needed)
 
-Install (optional):
+Tip: If running on localhost, ensure Ansible uses your venv’s Python, e.g. via inventory:
 
-```bash
-python3 -m pip install --upgrade pip wheel
-python3 -m pip install ansible cryptography
-```
-
-## Ansible configuration
-
-`ansible.cfg` already contains:
-
-```
-[defaults]
-library = ./library
-module_utils = ./module_utils
-```
-
-`inventory.ini` pins the Python interpreter (adjust to your venv path):
-
-```
+```ini
 [local]
-localhost ansible_connection=local ansible_python_interpreter=/Users/andreas/venv-ansible/bin/python3
-```
-
-## Parameters (splunksecrets)
-
-- `path` (str, required, alias `file`): path to INI file (e.g. `authentication.conf`)
-- `splunksecretfile` (str, default `/opt/splunk/etc/auth/splunk.secret`): path to `splunk.secret`
-- `password` (str, required, no_log=True): desired cleartext password
-- `stanza` (str, required, alias `section`): INI section/stanza
-- `key` (str, required): key within the stanza
-- `fail_if_missing` (bool, default: true): fail if file/stanza/key are missing
-- `encoding` (str, default: `utf-8`): file encoding for INI
-
-## Behavior & idempotency
-
-- Module decrypts the current value (if `$1$`/`$7$`).
-- If cleartext equals `password` → `changed: false`, `msg: ok`.
-- Otherwise it re-encrypts and writes → `changed: true`, `msg: updated password`.
-- Scheme selection:
-  - If old value is `$7$`: prefer `$7$` again (fallback `$1$` if AES‑GCM not available).
-  - If old value is `$1$`: stay with `$1$`.
-  - If no prefix: prefer `$7$`, fallback `$1$`.
-- Check‑mode (`--check`) supported and shows what would change.
-
-Return values (excerpt, no secrets):
-
-- `changed` (bool)
-- `msg` ("ok" | "updated password")
-- `encryption_scheme` ("1" | "7", only on update/check‑mode)
-- `path`, `stanza`, `key`
-
-## Examples
-
-Minimal task (adjust paths):
-
-```yaml
-- name: set passwords in authentication.conf
-  splunksecrets:
-    splunksecretfile: "/opt/splunk/etc/auth/splunk.secret"
-    password: "MySecretPassword42!"
-    path: "/opt/splunk/etc/apps/your_app/default/authentication.conf"
-    stanza: "your.realm"
-    key: "bindDNpassword"
-```
-
-Full example playbook (see `test.yml`):
-
-```yaml
-- name: "set splunksecrets encrypted values"
-  hosts: all
-  gather_facts: false
-  tasks:
-    - name: set passwords in authentication.conf
-      splunksecrets:
-        splunksecretfile: "/Users/andreas/splunk/etc/auth/splunk.secret"
-        password: "Password02"
-        path: "/Users/andreas/splunk/etc/apps/bw_cfg_auth-base/default/authentication.conf"
-        stanza: "bwlab.loc"
-        key: "bindDNpassword"
-
-    # Check-mode example (show changes only)
-    # ansible-playbook -i inventory.ini test.yml --check
-```
-
-## Run
-
-```bash
-ansible-playbook -i inventory.ini test.yml
+localhost ansible_connection=local ansible_python_interpreter=/path/to/venv/bin/python3
 ```
 
 ## Troubleshooting
 
 - `ModuleNotFoundError: No module named 'cryptography'`
-  - Ensure Ansible uses your venv's Python (see `inventory.ini`), or install `cryptography`:
+  - Ensure Ansible uses your venv’s Python or install `cryptography`:
     ```bash
     python3 -m pip install cryptography
     ```
 
-- `INI file not found` / `Stanza ... not found` / `Key ... not found`
-  - Verify paths, stanza/key names, and file permissions.
-
-- Local run uses wrong Python
-  - Inspect interpreter:
-    ```bash
-    ansible all -i inventory.ini -m debug -a 'var=ansible_python_interpreter'
-    ```
+- Could not find module_utils
+  - When using the collection, always reference the module via FQCN or add the collection under `collections:`. The collection ships its own `plugins/module_utils/splunk_crypto.py`.
 
 ## Security
 
@@ -139,6 +124,6 @@ ansible-playbook -i inventory.ini test.yml
 
 ## References / Credits
 
-- Crypto implementation is based on Hurricane Labs' project:
+- Crypto implementation is based on Hurricane Labs’ project:
   - https://github.com/HurricaneLabs/splunksecrets (original `splunk.py`)
-  - This repository adapts it as `module_utils/splunk_crypto.py` for Ansible usage.
+  - This collection adapts it as `plugins/module_utils/splunk_crypto.py` for Ansible usage.
