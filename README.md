@@ -15,7 +15,7 @@ You can install this collection from Ansible Galaxy, from GitHub via requirement
 ### A) From Ansible Galaxy (recommended)
 
 ```bash
-ansible-galaxy collection install git+https://github.com/schose/ansible_splunksecrets.git,main
+ansible-galaxy collection install git+https://github.com/schose/splunksecrets.git,main
 ```
 
 ### B) From GitHub (requirements.yml)
