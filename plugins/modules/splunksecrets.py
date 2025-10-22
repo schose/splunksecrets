@@ -115,19 +115,146 @@ from ansible.module_utils.basic import AnsibleModule
 from configparser import ConfigParser, MissingSectionHeaderError
 import os
 
-# Clean import via Ansible module_utils so the dependency is shipped with the module
-from ansible.module_utils.splunk_crypto import decrypt, encrypt, encrypt_new  # type: ignore
+# Crypto helpers vendored inline (based on HurricaneLabs/splunksecrets splunk.py)
+import base64
+import itertools
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.decrepit.ciphers.algorithms import ARC4
+from cryptography.hazmat.primitives.ciphers import algorithms, Cipher, modes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
 
+
+def b64decode(encoded):
+    """Wrapper around base64.b64decode to add padding if necessary"""
+    padding_len = 4 - (len(encoded) % 4)
+    if padding_len < 4:
+        encoded += "=" * padding_len
+    return base64.b64decode(encoded)
+
+
+def decrypt(secret, ciphertext, nosalt=False):
+    """Given the first 16 bytes of splunk.secret, decrypt a Splunk password"""
+    plaintext = None
+
+    if isinstance(ciphertext, str) and ciphertext.startswith("$1$"):
+        ciphertext_bytes = b64decode(ciphertext[3:])
+        if len(secret) < 16:
+            raise ValueError(f"secret too short, need 16 bytes, got {len(secret)}")
+        key = secret[:16]
+
+        algorithm = ARC4(key)
+        cipher = Cipher(algorithm, mode=None, backend=default_backend())
+        decryptor = cipher.decryptor()
+        plaintext_bytes = decryptor.update(ciphertext_bytes)
+
+        chars = []
+        if nosalt is False:
+            for char1, char2 in zip(plaintext_bytes[:-1], itertools.cycle("DEFAULTSA")):
+                if char1 == ord(char2):
+                    chars.append(char1)
+                else:
+                    chars.append(char1 ^ ord(char2))
+        else:
+            chars = plaintext_bytes[:-1]
+
+        plaintext = "".join([chr(c) for c in chars])
+    elif isinstance(ciphertext, str) and ciphertext.startswith("$7$"):
+        # pad secret to 254 bytes with nulls
+        if isinstance(secret, str):
+            secret = secret.encode()
+        secret = secret.ljust(254, b"\0")
+
+        ciphertext_bytes = b64decode(ciphertext[3:])
+
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b"disk-encryption",
+            iterations=1,
+            backend=default_backend(),
+        )
+        key = kdf.derive(secret[:254])
+
+        iv = ciphertext_bytes[:16]
+        tag = ciphertext_bytes[-16:]
+        ct = ciphertext_bytes[16:-16]
+
+        algorithm = algorithms.AES(key)
+        cipher = Cipher(algorithm, mode=modes.GCM(iv, tag), backend=default_backend())
+        decryptor = cipher.decryptor()
+        plaintext = decryptor.update(ct).decode()
+
+    return plaintext
+
+
+def encrypt(secret, plaintext, nosalt=False):
+    """Given the first 16 bytes of splunk.secret, encrypt a Splunk password"""
+    if len(secret) < 16:
+        raise ValueError(f"secret too short, need 16 bytes, got {len(secret)}")
+
+    key = secret[:16]
+
+    chars = []
+    if nosalt is False:
+        for char1, char2 in zip(plaintext, itertools.cycle("DEFAULTSA")):
+            if ord(char1) == ord(char2):
+                chars.append(ord(char1))
+            else:
+                chars.append(ord(char1) ^ ord(char2))
+    else:
+        chars = [ord(x) for x in plaintext]
+
+    chars.append(0)
+
+    plaintext_bytes = b"".join([bytes([c]) for c in chars])
+
+    algorithm = ARC4(key)
+    cipher = Cipher(algorithm, mode=None, backend=default_backend())
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(plaintext_bytes)
+    ciphertext = base64.b64encode(ciphertext).decode()
+
+    return f"$1${ciphertext}"
+
+
+def encrypt_new(secret, plaintext, iv=None):
+    """Use the new AES 256 GCM encryption in Splunk 7.2"""
+
+    if isinstance(secret, str):
+        # pad secret to 254 bytes with nulls
+        secret = secret.encode()
+    secret = secret.ljust(254, b"\0")
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"disk-encryption",
+        iterations=1,
+        backend=default_backend(),
+    )
+    key = kdf.derive(secret[:254])
+
+    if iv is None:
+        iv = os.urandom(16)
+
+    algorithm = algorithms.AES(key)
+    cipher = Cipher(algorithm, mode=modes.GCM(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(plaintext.encode()) + encryptor.finalize()
+    payload = base64.b64encode(b"%s%s%s" % (iv, ciphertext, encryptor.tag)).decode()
+
+    return f"$7${payload}"
 
 def main():
     module_args = dict(
         path=dict(type='path', required=True, aliases=['file']),
         splunksecretfile=dict(type='str', required=False, default='/opt/splunk/etc/auth/splunk.secret'),
-    password=dict(type='str', required=True, no_log=True),
+        password=dict(type='str', required=True, no_log=True),
         stanza=dict(type='str', required=True, aliases=['section']),
         key=dict(type='str', required=True),
         default=dict(type='str', required=False, default=None),
-        fail_if_missing=dict(type='bool', required=False, default=True),
+        fail_if_missing=dict(type='bool', required=False, default=False),
         encoding=dict(type='str', required=False, default='utf-8'),
     )
 
@@ -164,7 +291,11 @@ def main():
         module.exit_json(**result)
 
     # Read INI
+    # Preserve key case when reading/writing
     parser = ConfigParser()
+    # By default, ConfigParser lower-cases option names. We need to preserve case.
+    # Setting optionxform to str keeps the original casing intact.
+    parser.optionxform = str  # type: ignore[attr-defined]
     try:
         # ConfigParser.read accepts encoding in Python 3
         read_ok = parser.read(path, encoding=encoding)
@@ -181,21 +312,69 @@ def main():
     except Exception as e:
         module.fail_json(msg=f"Error reading INI file: {e}", **result)
 
-    # Section/Stanza present?
-    if not parser.has_section(stanza) and stanza != parser.default_section:
-        if fail_if_missing:
-            module.fail_json(msg=f"Stanza/section '{stanza}' not found in {abs_path}", **result)
+    # Determine presence of stanza and key
+    has_stanza = parser.has_section(stanza) or stanza == parser.default_section
+
+    # Case-insensitive key lookup while preserving original case for read-back
+    actual_key = None
+    if has_stanza:
+        try:
+            for existing_key in parser.options(stanza):
+                if existing_key.lower() == key.lower():
+                    actual_key = existing_key
+                    break
+        except Exception:
+            pass
+
+    # If stanza or key is missing: create/set with encrypted desired password
+    if (not has_stanza) or (actual_key is None):
+        # Read Splunk secret file as bytes (needed for encryption)
+        try:
+            with open(module.params['splunksecretfile'], 'rb') as f:
+                secret = f.read()
+        except Exception as e:
+            module.fail_json(msg=f"Error reading Splunk secret file '{module.params['splunksecretfile']}': {e}", **result)
+
+        desired_password = module.params['password']
+        # Prefer $7$ (AES-GCM), fallback to $1$ (RC4)
+        try:
+            try:
+                new_encrypted = encrypt_new(secret, desired_password)
+                scheme = '7'
+            except Exception:
+                new_encrypted = encrypt(secret, desired_password, nosalt=False)
+                scheme = '1'
+        except Exception as e:
+            module.fail_json(msg=f"Error encrypting new password: {e}", **result)
+
+        if module.check_mode:
+            result['changed'] = True
+            if not has_stanza and stanza != parser.default_section:
+                result['msg'] = 'would create stanza and set password'
+            else:
+                result['msg'] = 'would set password'
+            result['encryption_scheme'] = scheme
+            module.exit_json(**result)
+
+        # Create stanza if needed (not for DEFAULT)
+        try:
+            if not has_stanza and stanza != parser.default_section:
+                parser.add_section(stanza)
+            # Write using requested key spelling
+            parser.set(stanza, key, new_encrypted)
+            with open(path, 'w', encoding=encoding) as fh:
+                parser.write(fh)
+        except Exception as e:
+            module.fail_json(msg=f"Error writing INI file: {e}", **result)
+
+        result['changed'] = True
+        result['encryption_scheme'] = scheme
+        result['msg'] = 'created password' if has_stanza else 'created stanza and password'
         module.exit_json(**result)
 
-    # Key present?
-    if not parser.has_option(stanza, key):
-        if fail_if_missing:
-            module.fail_json(msg=f"Key '{key}' in stanza '{stanza}' not found in {abs_path}", **result)
-        module.exit_json(**result)
-
-    # Read value
+    # Read value (existing key path)
     try:
-        value = parser.get(stanza, key)
+        value = parser.get(stanza, actual_key)
     except Exception as e:
         module.fail_json(msg=f"Error reading '{stanza}.{key}': {e}", **result)
 
@@ -259,7 +438,8 @@ def main():
 
     # Update INI and write back
     try:
-        parser.set(stanza, key, new_encrypted)
+        # Write back using the original key spelling
+        parser.set(stanza, actual_key, new_encrypted)
         with open(path, 'w', encoding=encoding) as fh:
             parser.write(fh)
     except Exception as e:
